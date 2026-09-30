@@ -12,13 +12,26 @@ from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import OccupancyGrid
 from rclpy.action import ActionClient
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from sensor_msgs.msg import Image
+from std_msgs.msg import Empty, String
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 
 from visualization_msgs.msg import Marker
 from visualization_msgs.msg import MarkerArray
+
+# PERCEPTION 1
+# i added this so the camera code can save photos
+from cave_explorer.perception1_dataset import (
+    KNOWN_LABELS,
+    clean_label,
+    prepare_dataset,
+    save_frame,
+    to_bgr,
+)
+# PERCEPTION 1 END
 
 
 def wrap_angle(angle):
@@ -125,6 +138,11 @@ class CaveExplorer(Node):
         self.computer_vision_model_ = cv2.CascadeClassifier(self.get_parameter('computer_vision_model_filename').value)
         self.image_sub_ = self.create_subscription(Image, 'camera/image', self.image_callback, 1)
 
+        # PERCEPTION 1
+        # makes the photo folders when the node starts
+        self.perception1_setup()
+        # PERCEPTION 1 END
+
         # Timer for main loop
         self.main_loop_timer_ = self.create_timer(0.2, self.main_loop)
     
@@ -189,6 +207,12 @@ class CaveExplorer(Node):
         # see http://wiki.ros.org/cv_bridge/Tutorials/ConvertingBetweenROSImagesAndOpenCVImagesPython
         image = self.cv_bridge_.imgmsg_to_cv2(image_msg, desired_encoding='passthrough')
 
+        # PERCEPTION 1
+        # save the picture before the stop sign boxes get drawn on it
+        # otherwise the dataset photos would have green boxes on them
+        self.perception1_consider_frame(image, image_msg.encoding)
+        # PERCEPTION 1 END
+
         # Create a grayscale version (some simple models use this)
         # image_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
@@ -223,6 +247,53 @@ class CaveExplorer(Node):
             self.get_logger().info('Artifact found!')
             self.localise_artifact()
 
+    # PERCEPTION 1
+    def perception1_setup(self):
+        # makes the folders. nothing gets saved until we ask
+        self.declare_parameter('dataset_directory', '~/cave_artefact_dataset')
+        self.declare_parameter('dataset_label', 'negative')
+        self._p1_root, self._p1_counts = prepare_dataset(
+            self.get_parameter('dataset_directory').value)
+        # stays false so the camera doesnt save every frame
+        self._p1_save_next = False
+        # listens for the name we type, like green_alien
+        self.create_subscription(String, 'dataset_label', self.perception1_label_callback, 10)
+        # listens for the save command
+        self.create_subscription(Empty, 'dataset_save', self.perception1_save_callback, 10)
+        self.get_logger().info(
+            'Perception 1 dataset: '
+            + str(self._p1_root)
+            + '. Labels: '
+            + ', '.join(KNOWN_LABELS)
+        )
+
+    def perception1_label_callback(self, msg):
+        # changes which folder the next photo goes in
+        label = clean_label(msg.data)
+        self.set_parameters([Parameter('dataset_label', Parameter.Type.STRING, label)])
+        self.get_logger().info('Perception 1 label set to ' + label)
+
+    def perception1_save_callback(self, _msg):
+        # next camera picture gets saved, the rest get ignored
+        self._p1_save_next = True
+        self.get_logger().info('Perception 1 will save the next camera frame')
+
+    def perception1_consider_frame(self, image, encoding):
+        # if we didnt ask to save, leave the picture alone
+        if not self._p1_save_next:
+            return
+        self._p1_save_next = False
+        try:
+            # swap the colours then write the file
+            frame = to_bgr(image, encoding)
+            if frame is None:
+                return
+            label = clean_label(self.get_parameter('dataset_label').value)
+            path = save_frame(self._p1_root, self._p1_counts, frame, label)
+            self.get_logger().info('Perception 1 saved ' + str(path))
+        except Exception as ex:
+            self.get_logger().error('Perception 1 could not save an image: ' + str(ex))
+    # PERCEPTION 1 END
 
     def localise_artifact(self):
         """
