@@ -21,6 +21,15 @@ from visualization_msgs.msg import Marker
 from visualization_msgs.msg import MarkerArray
 
 
+# PLANNING 2
+# i added this so the rover can stand close and look at an artefact
+from cave_explorer.planning2_inspection import (
+    inspection_viewpoints,
+    same_spot,
+    worth_inspecting,
+)
+# PLANNING 2 END
+
 def wrap_angle(angle):
     """Function to wrap an angle between 0 and 2*Pi"""
     while angle < 0.0:
@@ -51,6 +60,10 @@ class PlannerType(Enum):
     GO_TO_FIRST_ARTIFACT = 3
     RANDOM_WALK = 4
     RANDOM_GOAL = 5
+    # PLANNING 2
+    # stand close and look at an artefact
+    CLOSE_RANGE_INSPECTION = 6
+    # PLANNING 2 END
     # Add more!
 
 
@@ -125,6 +138,11 @@ class CaveExplorer(Node):
         self.computer_vision_model_ = cv2.CascadeClassifier(self.get_parameter('computer_vision_model_filename').value)
         self.image_sub_ = self.create_subscription(Image, 'camera/image', self.image_callback, 1)
 
+        # PLANNING 2
+        # gets the close look ready, nothing moves until the main loop asks
+        self.planning2_setup()
+        # PLANNING 2 END
+
         # Timer for main loop
         self.main_loop_timer_ = self.create_timer(0.2, self.main_loop)
     
@@ -171,6 +189,19 @@ class CaveExplorer(Node):
         # Set current limits
         self.xlim_ = [map_origin[0], map_origin[0]+map_width*map_resolution]
         self.ylim_ = [map_origin[1], map_origin[1]+map_height*map_resolution]
+
+        # PLANNING 2
+        # keep the map so a close look doesnt get picked inside a wall
+        self._p2_map = (
+            map_origin[0],
+            map_origin[1],
+            map_resolution,
+            map_width,
+            map_height,
+            [int(value) for value in map_msg.data],
+            0.35,
+        )
+        # PLANNING 2 END
 
         # self.get_logger().warn('Map received:')
         # self.get_logger().warn(f'  xlim = [{self.xlim_[0]:.2f}, {self.xlim_[1]:.2f}]')
@@ -296,6 +327,11 @@ class CaveExplorer(Node):
         goal_handle = future.result()
         if not goal_handle.accepted:
             self.get_logger().error('Goal rejected')
+            # PLANNING 2
+            # blocked spot, try the next look instead of sitting here
+            self.ready_for_next_goal_ = True
+            self.planning2_goal_finished()
+            # PLANNING 2 END
             return
 
         # Goal accepted: get result when it's completed
@@ -315,6 +351,10 @@ class CaveExplorer(Node):
 
         result = future.result().result
         self.get_logger().info(f'Goal reached!')
+        # PLANNING 2
+        # that look is done, the next one goes out on the next loop
+        self.planning2_goal_finished()
+        # PLANNING 2 END
         self.ready_for_next_goal_ = True
 
 
@@ -396,6 +436,108 @@ class CaveExplorer(Node):
         )
         self.planner_go_to_pose2d(goal_pose2d)
 
+    # PLANNING 2
+    def planning2_setup(self):
+        # the starter already has one artefact spot, we look at that up close
+        # perception points get added later if they show up
+        self.declare_parameter('inspection_distance', 2.2)
+        self.declare_parameter('inspection_x', 18.1)
+        self.declare_parameter('inspection_y', 6.6)
+        self._p2_queue = []
+        self._p2_done = []
+        self._p2_current = None
+        self._p2_waiting = False
+        self._p2_map = None
+        self._p2_seed_used = False
+
+    def planning2_targets(self):
+        # starter spot first, then real artefact points, skip ones we already looked at
+        targets = []
+        seed = (
+            float(self.get_parameter('inspection_x').value),
+            float(self.get_parameter('inspection_y').value),
+        )
+        if not self._p2_seed_used:
+            targets.append(seed)
+        points = []
+        for point in self.artifact_locations_:
+            points.append((point.x, point.y, point.z))
+        for spot in worth_inspecting(points, self._p2_done):
+            if any(same_spot(spot, old, 1.5) for old in targets):
+                continue
+            targets.append(spot)
+        fresh = []
+        for spot in targets:
+            if any(same_spot(spot, old, 1.5) for old in self._p2_done):
+                continue
+            fresh.append(spot)
+        return fresh
+
+    def planning2_has_work(self):
+        # true when theres still a close look left to do
+        return bool(self._p2_queue) or bool(self.planning2_targets())
+
+    def planning2_fill(self):
+        # build the stand spots for the next artefact
+        if self._p2_queue:
+            return
+        targets = self.planning2_targets()
+        if not targets:
+            return
+        target = targets[0]
+        seed = (
+            float(self.get_parameter('inspection_x').value),
+            float(self.get_parameter('inspection_y').value),
+        )
+        if same_spot(target, seed, 0.2):
+            self._p2_seed_used = True
+        pose = self.get_pose_2d()
+        if pose is None:
+            robot_x, robot_y = 0.0, 0.0
+        else:
+            robot_x, robot_y = pose.x, pose.y
+        distance = float(self.get_parameter('inspection_distance').value)
+        views = inspection_viewpoints(
+            target[0], target[1], robot_x, robot_y, distance, self._p2_map)
+        self._p2_current = target
+        if not views:
+            # nowhere free to stand, leave this one and move on
+            self._p2_done.append(target)
+            self._p2_current = None
+            return
+        self._p2_queue = views
+
+    def planning2_goal_finished(self):
+        # one look finished or got rejected
+        if not self._p2_waiting:
+            return
+        self._p2_waiting = False
+        if self._p2_queue:
+            self._p2_queue.pop(0)
+        if self._p2_queue:
+            return
+        if self._p2_current is not None:
+            self._p2_done.append(self._p2_current)
+            self.get_logger().info('Planning 2 finished the close look')
+            self._p2_current = None
+
+    def planner_close_range_inspection(self):
+        # send the next stand spot, the starter nav goal does the driving
+        if not self._p2_queue:
+            self.planning2_fill()
+        if not self._p2_queue:
+            self.ready_for_next_goal_ = True
+            return
+        x, y, theta = self._p2_queue[0]
+        goal_pose2d = Pose2D()
+        goal_pose2d.x = float(x)
+        goal_pose2d.y = float(y)
+        goal_pose2d.theta = float(theta)
+        self._p2_waiting = True
+        self.get_logger().info('Planning 2 going close to look at the artefact')
+        self.planner_go_to_pose2d(goal_pose2d)
+    # PLANNING 2 END
+
     def main_loop(self):
         """
         Set the next goal pose and send to the action server
@@ -430,7 +572,12 @@ class CaveExplorer(Node):
         #######################################################
         # Select the next planner to execute
         # Update this logic as you see fit!
-        if not self.reached_first_artifact_:
+        # PLANNING 2
+        # look up close first, then the starter carries on with its own goals
+        if self.planning2_has_work():
+            self.planner_type_ = PlannerType.CLOSE_RANGE_INSPECTION
+        # PLANNING 2 END
+        elif not self.reached_first_artifact_:
             self.planner_type_ = PlannerType.GO_TO_FIRST_ARTIFACT
         elif not self.returned_home_:
             self.planner_type_ = PlannerType.RETURN_HOME
@@ -451,6 +598,10 @@ class CaveExplorer(Node):
             self.planner_random_walk()
         elif self.planner_type_ == PlannerType.RANDOM_GOAL:
             self.planner_random_goal()
+        # PLANNING 2
+        elif self.planner_type_ == PlannerType.CLOSE_RANGE_INSPECTION:
+            self.planner_close_range_inspection()
+        # PLANNING 2 END
         else:
             self.get_logger().error('No valid planner selected')
             self.destroy_node()
