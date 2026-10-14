@@ -1,0 +1,9 @@
+Verification performed 2026-10-14 UTC
+
+19 automated tests passed under Python 3.12 and OpenCV 4.10.0.
+Python source also parses with Python 3.10 grammar.
+Installer tested on the exact uploaded package.
+Evaluator completed all 14 condition/pipeline combinations using the supplied stop_data.xml and a synthetic negative image.
+This smoke check validates execution and output generation only. It provides no artefact detection accuracy or robustness evidence.
+
+Not tested here: ROS 2 Humble, Gazebo Fortress, real action transport, TF availability, map exploration coverage, actual target inspection, performance on the user dataset.
