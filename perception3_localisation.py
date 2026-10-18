@@ -9,7 +9,7 @@ import numpy as np
 from geometry_msgs.msg import Point
 from sensor_msgs.msg import Image
 from visualization_msgs.msg import Marker, MarkerArray
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 from rclpy.time import Time
 from tf2_ros import TransformException
 from cave_explorer.perception3_geometry import depth_point, transform_point, ArtefactTracks
@@ -18,19 +18,34 @@ from cave_explorer.perception3_geometry import depth_point, transform_point, Art
 class Perception3:
     def __init__(self, node):
         self.node = node
-        self.depths = deque(maxlen=12)
-        self.pending = deque(maxlen=12)
+        node.declare_parameter('p3_depth_buffer_size', 120)
+        node.declare_parameter('p3_depth_qos_depth', 120)
+        buffer_size = int(node.get_parameter('p3_depth_buffer_size').value)
+        qos_depth = int(node.get_parameter('p3_depth_qos_depth').value)
+        if not 1 <= buffer_size <= 600 or not 1 <= qos_depth <= 600:
+            raise ValueError('P3 depth buffer and QoS depths must be between 1 and 600')
+        self.depths = deque(maxlen=buffer_size)
+        self.pending = deque(maxlen=120)
         self.tracker = ArtefactTracks()
         self.last_stamp = None
         self.last_warning = {}
         node.declare_parameter('p3_merge_radius', 0.75)
-        node.declare_parameter('p3_sync_tolerance', 0.08)
+        node.declare_parameter('p3_sync_tolerance', 0.50)
+        node.declare_parameter('p3_pending_timeout', 6.0)  # ROS/simulation seconds
+        node.declare_parameter('p3_pending_wall_timeout', 120.0)  # stalled-clock watchdog
         node.declare_parameter('p3_hfov', 2.0944)
         self.tracker.radius = float(node.get_parameter('p3_merge_radius').value)
         if self.tracker.radius <= 0:
             raise ValueError('p3_merge_radius must be positive')
+        depth_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST, depth=qos_depth,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE)
         self.sub = node.create_subscription(Image, 'camera/depth/image', self.depth_callback,
-                                            qos_profile_sensor_data)
+                                            depth_qos)
+        node.get_logger().info(
+            f"Perception 3 sync repair v2: tolerance={node.get_parameter('p3_sync_tolerance').value}s; "
+            f"depth history={buffer_size}; subscription depth={qos_depth}")
         self.timer = node.create_timer(0.05, self.process)
         self.marker_timer = node.create_timer(1.0, self.publish_markers)
 
@@ -79,8 +94,13 @@ class Perception3:
         if image_msg.header.frame_id != 'camera_link':
             self.warn('rgb_frame', 'RGB must come from supplied Gazebo camera_link sensor')
             return
-        self.pending.append((image_msg.header, image_msg.height, image_msg.width,
-                             list(detections), time.monotonic()))
+        if len(self.pending) == self.pending.maxlen:
+            self.warn('queue', 'Pending queue full; dropping oldest observation')
+        self.pending.append(dict(
+            header=image_msg.header, height=image_msg.height, width=image_msg.width,
+            detections=list(detections), received_wall=time.monotonic(),
+            received_ros=self.node.get_clock().now().nanoseconds/1e9,
+            depth=None, reason='No depth message received'))
         self.process()
 
     def reset(self):
@@ -96,28 +116,54 @@ class Perception3:
         radius = float(self.node.get_parameter('p3_merge_radius').value)
         if radius > 0:
             self.tracker.radius = radius
-        remaining = deque(maxlen=12)
+        remaining = deque(maxlen=self.pending.maxlen)
+        now_ros = self.node.get_clock().now().nanoseconds/1e9
         while self.pending:
             item = self.pending.popleft()
-            header, height, width, detections, received = item
+            header = item['header']
+            height, width = item['height'], item['width']
+            detections = item['detections']
             stamp = header.stamp.sec + header.stamp.nanosec*1e-9
-            if time.monotonic()-received > 1.5:
-                self.warn('timeout', 'Skipped observation: matching depth or timestamped TF unavailable')
+            ros_age = now_ros-item['received_ros']
+            wall_age = time.monotonic()-item['received_wall']
+            if ros_age < 0:
+                self.reset()
+                return
+            if (ros_age > float(self.node.get_parameter('p3_pending_timeout').value)
+                    or wall_age > float(self.node.get_parameter('p3_pending_wall_timeout').value)):
+                self.warn('timeout', f"Skipped observation at {stamp:.3f}: {item['reason']}; "
+                          f"waited {ros_age:.2f}s ROS / {wall_age:.1f}s wall")
                 continue
-            if not self.depths:
-                remaining.append(item)
-                continue
-            ds, depth = min(self.depths, key=lambda pair: abs(pair[0]-stamp))
-            tolerance = float(self.node.get_parameter('p3_sync_tolerance').value)
-            if abs(ds-stamp) > tolerance:
-                remaining.append(item)
-                continue
-            if depth.shape != (height, width) or (height, width) != (480, 720):
-                self.warn('size', 'Expected aligned 720x480 RGB/depth; recalibrate for changed camera')
-                continue
+            depth = item['depth']
+            if depth is None:
+                if not self.depths:
+                    item['reason'] = 'No accepted depth on /camera/depth/image'
+                    self.warn('depth_wait', item['reason'])
+                    remaining.append(item)
+                    continue
+                ds, depth = min(self.depths, key=lambda pair: abs(pair[0]-stamp))
+                tolerance = float(self.node.get_parameter('p3_sync_tolerance').value)
+                if abs(ds-stamp) > tolerance:
+                    item['reason'] = (f'RGB-depth mismatch: nearest delta={abs(ds-stamp):.3f}s '
+                                      f'exceeds tolerance={tolerance:.3f}s; RGB={stamp:.3f}, '
+                                      f'buffer=[{self.depths[0][0]:.3f}, {self.depths[-1][0]:.3f}], '
+                                      f'frames={len(self.depths)}')
+                    self.warn('sync_wait', item['reason'])
+                    remaining.append(item)
+                    continue
+                if depth.shape != (height, width) or (height, width) != (480, 720):
+                    self.warn('size', 'Expected aligned 720x480 RGB/depth; recalibrate for changed camera')
+                    continue
+                item['depth'] = depth
+                if abs(ds-stamp) > 0.20:
+                    self.warn('approx_sync',
+                              f'Using approximate RGB-depth pair: delta={abs(ds-stamp):.3f}s '
+                              f'(limit={tolerance:.3f}s); motion can reduce position accuracy')
             try:
                 tf = self.node.tf_buffer.lookup_transform('map', 'camera_link', Time.from_msg(header.stamp))
-            except TransformException:
+            except TransformException as error:
+                item['reason'] = f'TF map <- camera_link at {stamp:.3f}: {error}'
+                self.warn('tf_wait', item['reason'])
                 remaining.append(item)
                 continue
             trans, rot = tf.transform.translation, tf.transform.rotation
