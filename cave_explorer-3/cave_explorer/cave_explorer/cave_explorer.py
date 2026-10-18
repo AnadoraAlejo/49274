@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 
+import array
 import math
 import random
 from enum import Enum
+from pathlib import Path
 
 import cv2  # OpenCV2
 import rclpy
@@ -20,6 +22,10 @@ from tf2_ros.transform_listener import TransformListener
 from visualization_msgs.msg import Marker
 from visualization_msgs.msg import MarkerArray
 
+
+# ADVANCED 2
+from cave_explorer.advanced2_geometry import analyse_map, geometry_text
+# ADVANCED 2 END
 
 def wrap_angle(angle):
     """Function to wrap an angle between 0 and 2*Pi"""
@@ -125,6 +131,10 @@ class CaveExplorer(Node):
         self.computer_vision_model_ = cv2.CascadeClassifier(self.get_parameter('computer_vision_model_filename').value)
         self.image_sub_ = self.create_subscription(Image, 'camera/image', self.image_callback, 1)
 
+        # ADVANCED 2
+        self.advanced2_setup()
+        # ADVANCED 2 END
+
         # Timer for main loop
         self.main_loop_timer_ = self.create_timer(0.2, self.main_loop)
     
@@ -176,6 +186,10 @@ class CaveExplorer(Node):
         # self.get_logger().warn(f'  xlim = [{self.xlim_[0]:.2f}, {self.xlim_[1]:.2f}]')
         # self.get_logger().warn(f'  ylim = [{self.ylim_[0]:.2f}, {self.ylim_[1]:.2f}]')
     
+        # ADVANCED 2
+        self.advanced2_on_map(map_msg)
+        # ADVANCED 2 END
+
     def image_callback(self, image_msg):
         """
         Recieve an RGB image.
@@ -395,6 +409,111 @@ class CaveExplorer(Node):
             theta = random.uniform(0, 2*math.pi)
         )
         self.planner_go_to_pose2d(goal_pose2d)
+
+    # ADVANCED 2
+    def advanced2_setup(self):
+        self.declare_parameter('geometry_directory', '~/cave_geometry')
+        self._a2_markers = self.create_publisher(MarkerArray, 'cave_geometry_markers', 10)
+        self._a2_image = self.create_publisher(Image, 'cave_geometry_image', 10)
+        self._a2_last = 0
+
+    def advanced2_on_map(self, map_msg):
+        now = self.get_clock().now().nanoseconds
+        if now - self._a2_last < 2000000000:
+            return
+        self._a2_last = now
+        try:
+            robot = None
+            try:
+                transform = self.tf_buffer.lookup_transform(
+                    'map', 'base_link', rclpy.time.Time())
+                robot = (
+                    transform.transform.translation.x,
+                    transform.transform.translation.y,
+                )
+            except TransformException:
+                robot = None
+            origin = map_msg.info.origin
+            quat = origin.orientation
+            yaw = math.atan2(
+                2.0 * quat.w * quat.z,
+                1.0 - 2.0 * quat.z * quat.z,
+            )
+            result = analyse_map(
+                map_msg.data,
+                int(map_msg.info.width),
+                int(map_msg.info.height),
+                float(map_msg.info.resolution),
+                float(origin.position.x),
+                float(origin.position.y),
+                yaw,
+                robot,
+            )
+            self.advanced2_publish(result)
+            self.advanced2_write(result)
+            if result['robot_width'] is None:
+                self.get_logger().info('Advanced 2 waiting for the robot to be on a free cell')
+            else:
+                self.get_logger().info(
+                    'Advanced 2 robot passage width {:.2f} m'.format(result['robot_width']))
+        except Exception as ex:
+            self.get_logger().error('Advanced 2 could not read the map: ' + str(ex))
+
+    def advanced2_publish(self, result):
+        marker_array = MarkerArray()
+        stamp = self.get_clock().now().to_msg()
+        spots = []
+        if result['narrow'] is not None:
+            spots.append((1, result['narrow'], 'narrow {:.1f}m'.format(result['narrow'][0]), 1.0, 0.2, 0.2))
+        if result['wide'] is not None:
+            spots.append((2, result['wide'], 'wide {:.1f}m'.format(result['wide'][0]), 0.2, 0.8, 0.2))
+        for marker_id, spot, label, red, green, blue in spots:
+            marker = Marker()
+            marker.header.frame_id = 'map'
+            marker.header.stamp = stamp
+            marker.ns = 'cave_geometry'
+            marker.id = marker_id
+            marker.type = Marker.TEXT_VIEW_FACING
+            marker.action = Marker.ADD
+            marker.pose.position.x = float(spot[1])
+            marker.pose.position.y = float(spot[2])
+            marker.pose.position.z = 1.0
+            marker.pose.orientation.w = 1.0
+            marker.scale.z = 0.5
+            marker.color.a = 1.0
+            marker.color.r = red
+            marker.color.g = green
+            marker.color.b = blue
+            marker.text = label
+            marker_array.markers.append(marker)
+        self._a2_markers.publish(marker_array)
+
+        image = result['image']
+        if not image or not image[0]:
+            return
+        height = len(image)
+        width = len(image[0])
+        picture = Image()
+        picture.header.frame_id = 'map'
+        picture.header.stamp = stamp
+        picture.height = height
+        picture.width = width
+        picture.encoding = 'mono8'
+        picture.is_bigendian = 0
+        picture.step = width
+        flat = []
+        for row in image:
+            flat.extend(row)
+        picture.data = array.array('B', flat)
+        self._a2_image.publish(picture)
+
+    def advanced2_write(self, result):
+        folder = self.get_parameter('geometry_directory').value
+        if folder.startswith('~'):
+            folder = str(Path(folder).expanduser())
+        Path(folder).mkdir(parents=True, exist_ok=True)
+        Path(folder, 'geometry.txt').write_text(geometry_text(result))
+    # ADVANCED 2 END
 
     def main_loop(self):
         """
